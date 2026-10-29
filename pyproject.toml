@@ -1,0 +1,17 @@
+[project]
+name = "order-api"
+version = "0.1.0"
+description = "Order Management capability for Mr D Tech Vetting Assignment"
+readme = "README.md"
+authors = [
+    { name = "Lisa Blackwell", email = "lisa_strydom@live.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+order-api = "order_api:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
