@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Seed demo products and demonstrate order idempotency and worker recovery.
 
@@ -97,8 +96,7 @@ def wait_for_processed_orders(
 
     while time.monotonic() < deadline:
         statuses = {
-            ref: (get_order(client, ref) or {}).get("status")
-            for ref in order_refs
+            ref: (get_order(client, ref) or {}).get("status") for ref in order_refs
         }
 
         rejected = [ref for ref, status in statuses.items() if status == "REJECTED"]
@@ -123,15 +121,14 @@ def seed_products(database_url: str, products: list[dict]) -> None:
     """Insert fresh demo products without modifying existing inventory."""
     import psycopg
 
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                """
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.executemany(
+            """
                 INSERT INTO products (sku, name, price_cents, stock)
                 VALUES (%(sku)s, %(name)s, %(price_cents)s, %(stock)s)
                 """,
-                products,
-            )
+            products,
+        )
 
     print(f"[seed] inserted {len(products)} demo products")
 
@@ -324,8 +321,7 @@ def run_interruption_phase(
 
     try:
         before = {
-            product["sku"]: get_stock(client, product["sku"])
-            for product in products
+            product["sku"]: get_stock(client, product["sku"]) for product in products
         }
 
         for payload in during:
@@ -351,8 +347,7 @@ def run_interruption_phase(
                 )
 
         still = {
-            product["sku"]: get_stock(client, product["sku"])
-            for product in products
+            product["sku"]: get_stock(client, product["sku"]) for product in products
         }
 
         print(f"[interruption] stock before pause={before}")
@@ -375,21 +370,18 @@ def run_interruption_phase(
 
     while time.monotonic() < deadline:
         last_statuses = {
-            ref: (get_order(client, ref) or {}).get("status")
-            for ref in refs
+            ref: (get_order(client, ref) or {}).get("status") for ref in refs
         }
 
         rejected = [
-            ref for ref, status in last_statuses.items()
-            if status == "REJECTED"
+            ref for ref, status in last_statuses.items() if status == "REJECTED"
         ]
 
         if rejected:
             raise RuntimeError(f"Orders unexpectedly rejected after resume: {rejected}")
 
         last_stock = {
-            product["sku"]: get_stock(client, product["sku"])
-            for product in products
+            product["sku"]: get_stock(client, product["sku"]) for product in products
         }
 
         if (
@@ -429,9 +421,7 @@ def main() -> int:
     parser.add_argument(
         "--sentinel",
         type=Path,
-        default=Path(
-            os.environ.get("WORKER_PAUSE_SENTINEL", str(DEFAULT_SENTINEL))
-        ),
+        default=Path(os.environ.get("WORKER_PAUSE_SENTINEL", str(DEFAULT_SENTINEL))),
         help="Pause sentinel path shared with the worker.",
     )
     parser.add_argument(

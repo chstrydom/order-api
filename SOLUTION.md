@@ -88,8 +88,7 @@ The draft does not include a separate log table because application logging is o
 | `POST /orders` | Create an order |
 | `GET /orders/{order_ref}` | Retrieve an order, its lines, and its status |
 | `GET /products/{sku}` | Retrieve product details and current stock |
-| `GET /reports/daily?date=YYYY-MM-DD` | Retrieve the daily report |
-
+| `GET /reports/daily?date=YYYY-MM-DD` | Retrieve the daily report (planned) |
 ### Expected HTTP behaviour
 
 - `POST /orders` returns `202 Accepted` with a `Location: /orders/{order_ref}` header: the order is durably persisted, but stock processing happens asynchronously. An identical retry also returns `202` with the existing order.
@@ -124,7 +123,7 @@ Order intake and stock processing are separate stages.
 ### Order intake guarantees
 - Duplicate SKUs in a request are consolidated into one order line, with quantities added together. The 1,000,000 per-line quantity limit applies to the consolidated quantity, and is checked in request validation (422) and again in the repository.
 - Product prices are resolved and the product rows are locked with `FOR KEY SHARE` for the duration of the intake transaction. This prevents deletion of the product without blocking the worker's stock updates.
-- The order total is calculated using The captured unit prices and consolidated quantities.
+- The order total is calculated using the captured unit prices and consolidated quantities.
 - The order and all order lines are inserted within one transaction.
 - If any requested SKU does not exist, order creation fails without persisting a partial order.
 - An identical retry is identified by comparing the customer and consolidated SKU quantities, rather than relying on the order of items in the request.
@@ -150,13 +149,13 @@ An identical retry of a rejected order returns the existing rejected order. It d
 
 The worker polls the orders table for eligible outstanding work. This is a database-backed work queue; it is not a separate message broker.
 
-The worker should prioritise older outstanding orders using created_at as the primary ordering field. A deterministic secondary ordering field should be used where timestamps are equal. Under concurrent processing, strict global FIFO ordering is not guaranteed.
+`process_one_order` takes the oldest outstanding order by `created_at`, with `order_ref` as the tie-breaker. Note that `created_at` is the start time of the intake transaction, so it reflects when an order began being stored, not when it committed. Under concurrent processing, strict global FIFO ordering is not guaranteed.
 
-The implementation must also prevent two workers from successfully processing the same order concurrently.
+Two workers cannot process the same order concurrently: the claim uses `FOR UPDATE SKIP LOCKED`, and a processed order no longer matches `status = 'RECEIVED'`.
 
-### Pause/resume for demonstration. 
+### Pause/resume for demonstration (planned)
 
-The stock worker checks for a sentinel file (path from `WORKER_PAUSE_SENTINEL`, default `.worker_paused`) on each poll. When present, it skips processing. This lets `scripts/seed_and_burst.py` demonstrate orders being accepted while stock processing is unavailable, and catching up after the sentinel is removed. The sentinel is a demonstration hook, not a production control.
+The worker runner will check for a sentinel file (path from `WORKER_PAUSE_SENTINEL`, default `.worker_paused`) on each poll, and skip processing while it exists. The check lives in the polling loop, not in `process_one_order`, which always processes when called. This lets `scripts/seed_and_burst.py` demonstrate orders being accepted while stock processing is unavailable, and catching up after the sentinel is removed. The sentinel is a demonstration hook, not a production control.
 
 ### Transactional stock processing
 
@@ -172,6 +171,12 @@ Within one database transaction, the worker must:
 The order status update and any stock deductions must commit together. If a database error occurs during processing, the transaction must roll back so that a retry cannot repeat a partially applied stock deduction.
 
 Concurrent orders competing for the same stock must be handled using appropriate database locking or conditional updates. Application-side stock checks alone are insufficient.
+
+### Implementation
+
+`process_one_order` claims the oldest `RECEIVED` order (`ORDER BY created_at, order_ref`) with `FOR UPDATE SKIP LOCKED`, so concurrent workers never take the same order and never wait on each other. It then locks the order's product rows with `FOR NO KEY UPDATE`, in SKU order, so workers that overlap on products cannot deadlock. `FOR NO KEY UPDATE` is sufficient because only `stock` changes, and it does not conflict with the `FOR KEY SHARE` lock taken during order intake, so intake is not blocked by the worker.
+
+If every line has enough stock, the quantities are deducted and the order becomes `PROCESSED`; otherwise nothing is deducted and the order becomes `REJECTED`. Stock changes and the status change happen in one transaction, so an exception rolls both back and the order remains `RECEIVED` for a later attempt. The function returns `True` when it handled an order (including a rejected one) and `False` when none was available. The `stock >= 0` CHECK constraint is a final backstop.
 
 ## 6. Database schema
 
@@ -264,7 +269,7 @@ The report is calculated using the state of the database at generation time. Con
 
 ## 8. Seed and burst
 
-Initial product seed data and a burst of demo orders (including intentional duplicates) are exercised end-to-end by `scripts/seed_and_burst.py`. See the "Burst script" section of README.md for flags and usage. Until the stock worker is implemented, run with `--skip-interruption`.
+Initial product seed data and a burst of demo orders (including intentional duplicates) are exercised end-to-end by `scripts/seed_and_burst.py`. See the "Burst script" section of README.md for flags and usage. The interruption scenario needs the polling runner and its pause sentinel, so until the runner exists, run with `--skip-interruption`.
 
 ## 9. Code organisation
 
@@ -273,7 +278,7 @@ The implementation uses a small separation of responsibilities:
 - **API routes:** HTTP request handling, response formatting, and input/output models.
 - **Business logic:** order rules, idempotency behaviour, and stock-processing decisions.
 - **Data access:** explicit SQL, database transactions, and queries.
-- **Worker:** polling and processing outstanding orders.
+- **Worker:** `worker/processor.py` processes a single order transactionally (implemented). The polling runner, with its interval, graceful shutdown and pause sentinel, is not yet implemented.
 
 The separation should make business rules testable without requiring every test to exercise the HTTP layer. Additional abstractions will be introduced only when they provide a clear benefit.
 
@@ -297,12 +302,11 @@ Implemented tests
 - Concurrent identical submissions produce exactly one order; concurrent conflicting submissions have exactly one winner.
 - HTTP behaviour for order creation, retrieval, duplicate and conflicting submissions, unknown SKUs, and invalid requests (422).
 - Database constraints: non-negative stock, order-line foreign keys, valid order status.
+- Sufficient and insufficient stock processing.
+- Stock processing: sufficient stock, exact-stock boundary, insufficient stock, no partial deduction when one line is short, no double processing, rejected orders not retried, oldest order first, rollback of stock and status on failure with a clean retry, concurrent workers processing a single order once, and concurrent workers not overselling limited stock.
 
 Remaining tests
-- Sufficient and insufficient stock processing.
-- Concurrent orders competing for limited stock.
-- Transaction rollback during stock processing.
-- Worker interruption and recovery.
+- Worker interruption and recovery (requires the runner).
 - Daily report calculations and status filtering.
 - HTTP behaviour for the daily report.
 

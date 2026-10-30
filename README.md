@@ -10,9 +10,10 @@ Design decisions, assumptions, and trade-offs are documented in [SOLUTION.md](SO
 |---|---|
 | Order intake (idempotent, price snapshots, atomic) | Implemented |
 | `GET /orders/{order_ref}`, `GET /products/{sku}`, `GET /health` | Implemented |
-| Stock-processing worker | Not yet implemented |
+| Stock processor (`process_one_order`) | Implemented |
+| Worker runner (polling, shutdown, Compose service) | Not yet implemented |
 | `GET /reports/daily` | Not yet implemented |
-| Application and worker containers | Not yet implemented |
+| Wontainers | Not yet implemented |
 | Seed + burst script (`scripts/seed_and_burst.py`) | Implemented (duplicate demo); interruption phase pending worker |
 
 ## Requirements
@@ -81,6 +82,8 @@ Interactive API documentation is available at `http://localhost:8000/docs` while
 | `POST /orders` | `202 Accepted` (order persisted with status `RECEIVED`; an identical retry returns the existing order) | `409` same `order_ref` with a different payload, `404` unknown SKU, `422` invalid request (including a combined quantity over 1,000,000 for one SKU) |
 | `GET /orders/{order_ref}` | `200` | `404` |
 | `GET /products/{sku}` | `200` | `404` |
+
+Orders stay `RECEIVED` until the stock processor runs. The polling worker that runs it automatically is not built yet.
 
 `POST /orders` returns `202` with a `Location` header because stock processing happens asynchronously after the order is stored. See [SOLUTION.md](SOLUTION.md).
 
