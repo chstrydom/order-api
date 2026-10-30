@@ -33,11 +33,27 @@ This document records the requirements, assumptions, design decisions, and trade
 - Insufficient stock policy: An order requesting more stock than is available is rejected. No stock is deducted, and the rejection is persisted as the order's terminal processing outcome. Partial fulfilment and waiting for future stock availability are out of scope.
 - An order reference identifies a single order submission. A new attempt after rejection must use a new order reference.
 
+|   Area	|   Status  |
+|   -   | - |
+|   PostgreSQL schema and initialisation	|   Implemented  |
+|   Product data access	|   Implemented  |
+|   Order request validation	|   Implemented  |
+|   Order intake and persistence	|   Implemented  |
+|   Duplicate SKU consolidation	|   Implemented  |
+|   Idempotent order submission	|   Implemented  |
+|   Order-line price snapshots	|   Implemented  |
+|   Unknown-product handling	|   Implemented  |
+|   FastAPI routes	|   Pending  |
+|   Stock-processing worker	|   Pending  |
+|   Transactional stock deduction	|   Pending  |
+|   Daily report	|   Pending  |
+|   Application containerisation	|   Pending  |
+
 ## 2. Technology choices
 
 ### Python and FastAPI
 
-Python 3.14 is the selected runtime because it is available in the development environment. Dependency compatibility is verified through installation and tests.
+Python 3.14 is the selected runtime because it is available in the development environment. The selected dependencies have been installed and verified through the current automated test suite.
 
 FastAPI provides typed request and response models, input validation, generated OpenAPI documentation, and a straightforward testing interface.
 
@@ -117,9 +133,18 @@ Order intake and stock processing are separate stages.
 5. A background worker polls outstanding orders and attempts stock processing.
 6. The worker records the final processing outcome.
 
+### Order intake guarantees
+- Duplicate SKUs in a request are consolidated into one order line, with quantities added together.
+- Product prices are resolved and locked for the duration of the intake transaction before the order is persisted.
+- The order total is calculated using The captured unit prices and consolidated quantities.
+- The order and all order lines are inserted within one transaction.
+- If any requested SKU does not exist, order creation fails without persisting a partial order.
+- An identical retry is identified by comparing the customer and consolidated SKU quantities, rather than relying on the order of items in the request.
+- A conflicting retry using the same order reference is rejected.
+
 This design allows order intake to continue while the worker is temporarily stopped, provided PostgreSQL and the API remain available.
 
-An order accepted by the intake API is not necessarily a successfully fulfilled order. Its status must make that distinction clear.
+Order acceptance means that the Orders capability has validated and durably persisted the submission. It does not guarantee stock availability or successful fulfilment. Stock processing occurs asynchronously, and the final outcome is reflected in the order status.
 
 ### Order statuses
 
@@ -137,7 +162,7 @@ An identical retry of a rejected order returns the existing rejected order. It d
 
 The worker polls the orders table for eligible outstanding work. This is a database-backed work queue; it is not a separate message broker.
 
-The worker should process older outstanding orders first unless testing demonstrates a reason to use a different ordering.
+The worker should prioritise older outstanding orders using created_at as the primary ordering field. A deterministic secondary ordering field should be used where timestamps are equal. Under concurrent processing, strict global FIFO ordering is not guaranteed.
 
 The implementation must also prevent two workers from successfully processing the same order concurrently.
 
@@ -231,7 +256,6 @@ The daily report is the selected extension option (Option B).
 The endpoint will report for the requested calendar date:
 
 - Total number of orders created, including orders that have not been processed or were rejected.
-- Order counts grouped by processing status.
 - Revenue from successfully processed orders, calculated using their stored order-line prices.
 - Units sold per SKU, counting only successfully processed orders.
 - Current stock per SKU.
@@ -243,6 +267,8 @@ The reporting date filters orders by creation date, not processing date.
 Revenue and units sold include only orders created on the requested date that have reached `PROCESSED` status by the time the report is generated.
 
 The reporting timezone must be documented and applied consistently when determining the calendar-day boundaries.
+
+The report is calculated using the state of the database at generation time. Consequently, a report generated for a past date may include orders that were still `RECEIVED` when an earlier version of that report was generated but have since become `PROCESSED`.
 
 ## 8. Code organisation
 
@@ -257,22 +283,36 @@ The separation should make business rules testable without requiring every test 
 
 ## 9. Testing strategy
 
-Tests will cover:
+Implemented tests
+- Database connection and schema initialisation.
+- Database-enforced non-negative product stock.
+- Product retrieval by SKU.
+- Multiple product retrieval and missing SKU handling.
+- Order request validation.
+- Successful order persistence.
+- Order total calculation.
+- Duplicate SKU consolidation.
+- Identical submission retry.
+- Conflicting submission using an existing order reference.
+- Product price snapshot preservation.
+- Unknown product handling.
+- No stock deduction during order intake.
+- Atomic order creation when a requested SKU is unknown.
 
-- Successful order creation and retrieval.
-- Duplicate submission with the same payload.
-- Reuse of an order reference with a different payload.
-- Product price snapshotting.
-- Unknown products and invalid quantities.
-- Sufficient and insufficient stock.
+Remaining tests
+- Order retrieval through the API.
+- Sufficient and insufficient stock processing.
 - Concurrent orders competing for limited stock.
-- Transaction rollback when processing fails.
-- Worker interruption and recovery, including processing outstanding work after restart.
-- Daily report totals and status filtering.
+- Transaction rollback during stock processing.
+- Worker interruption and recovery.
+- Daily report calculations and status filtering.
+- HTTP response behaviour.
 
 The two required unhappy-path demonstrations are duplicate submission and temporary stock-processing interruption followed by catch-up.
 
 Database tests also verify the connection, schema initialisation, and database-enforced constraints.
+
+The current automated test suite contains 20 passing tests covering the implemented database, product-repository, order-repository, and request-validation functionality.
 
 ## 10. Out of scope
 
