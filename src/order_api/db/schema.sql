@@ -36,3 +36,12 @@ CREATE TABLE IF NOT EXISTS order_lines (
         REFERENCES products (sku)
         ON DELETE RESTRICT
 );
+
+-- Keeps the worker's "oldest RECEIVED order" lookup cheap as history grows.
+CREATE INDEX IF NOT EXISTS idx_orders_received
+    ON orders (created_at, order_ref)
+    WHERE status = 'RECEIVED';
+
+-- Supports the daily report's created_at range filter.
+CREATE INDEX IF NOT EXISTS idx_orders_created_at
+    ON orders (created_at);
