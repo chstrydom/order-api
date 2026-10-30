@@ -13,6 +13,7 @@ Design decisions, assumptions, and trade-offs are documented in [SOLUTION.md](SO
 | Stock-processing worker | Not yet implemented |
 | `GET /reports/daily` | Not yet implemented |
 | Application and worker containers | Not yet implemented |
+| Seed + burst script (`scripts/seed_and_burst.py`) | Implemented (duplicate demo); interruption phase pending worker |
 
 ## Requirements
 
@@ -44,6 +45,32 @@ uv run uvicorn order_api.main:app --reload
 ```
 
 The schema is created automatically when the API starts.
+
+## Burst script
+
+`scripts/seed_and_burst.py` seeds demo products and submits a short burst of orders, intentionally including duplicate submissions of the same `order_ref`. Each run uses a unique run ID, so it can be re-run without colliding with earlier data.
+
+Until the stock-processing worker is implemented, run with `--skip-interruption`:
+
+```bash
+uv run python scripts/seed_and_burst.py --skip-interruption
+```
+
+Once the worker honours the pause sentinel, drop the flag to also demonstrate the interruption/catch-up path:
+
+```bash
+uv run python scripts/seed_and_burst.py
+```
+
+| Flag | Purpose |
+|---|---|
+| `--api-url` | Base URL of the running API (default `http://localhost:8000`, or `$API_URL`). |
+| `--database-url` | Database used only for seeding demo products (default `$DATABASE_URL`). |
+| `--sentinel` | Pause-file path shared with the worker (default `.worker_paused`, or `$WORKER_PAUSE_SENTINEL`). |
+| `--skip-interruption` | Skip the pause/resume phase. Use this until the worker is implemented. |
+| `--settle-seconds` | Maximum time to wait for the worker to process orders (default 15). |
+
+The script exits non-zero if any phase fails, so it is safe to run in CI. See [SOLUTION.md](SOLUTION.md) for the pause-sentinel contract.
 
 ## API documentation
 

@@ -154,6 +154,10 @@ The worker should prioritise older outstanding orders using created_at as the pr
 
 The implementation must also prevent two workers from successfully processing the same order concurrently.
 
+### Pause/resume for demonstration. 
+
+The stock worker checks for a sentinel file (path from `WORKER_PAUSE_SENTINEL`, default `.worker_paused`) on each poll. When present, it skips processing. This lets `scripts/seed_and_burst.py` demonstrate orders being accepted while stock processing is unavailable, and catching up after the sentinel is removed. The sentinel is a demonstration hook, not a production control.
+
 ### Transactional stock processing
 
 Stock deductions and the corresponding order status update must be atomic.
@@ -258,7 +262,11 @@ The reporting timezone must be documented and applied consistently when determin
 
 The report is calculated using the state of the database at generation time. Consequently, a report generated for a past date may include orders that were still `RECEIVED` when an earlier version of that report was generated but have since become `PROCESSED`.
 
-## 8. Code organisation
+## 8. Seed and burst
+
+Initial product seed data and a burst of demo orders (including intentional duplicates) are exercised end-to-end by `scripts/seed_and_burst.py`. See the "Burst script" section of README.md for flags and usage. Until the stock worker is implemented, run with `--skip-interruption`.
+
+## 9. Code organisation
 
 The implementation uses a small separation of responsibilities:
 
@@ -269,7 +277,7 @@ The implementation uses a small separation of responsibilities:
 
 The separation should make business rules testable without requiring every test to exercise the HTTP layer. Additional abstractions will be introduced only when they provide a clear benefit.
 
-## 9. Testing strategy
+## 10. Testing strategy
 
 Implemented tests
 - Database connection and schema initialisation.
@@ -291,7 +299,6 @@ Implemented tests
 - Database constraints: non-negative stock, order-line foreign keys, valid order status.
 
 Remaining tests
-- A rejected order does not currently record a reason.
 - Sufficient and insufficient stock processing.
 - Concurrent orders competing for limited stock.
 - Transaction rollback during stock processing.
@@ -305,7 +312,7 @@ Every test starts from empty tables. The test suite refuses to run unless the da
 
 The automated test suite covers the implemented database constraints, product and order repositories, request validation, concurrent duplicate submissions, and the HTTP API. Run `uv run pytest` for the current count.
 
-## 10. Out of scope
+## 11. Out of scope
 
 - Order cancellation.
 - Stock replenishment.
@@ -317,12 +324,10 @@ The automated test suite covers the implemented database constraints, product an
 - Price refresh for existing orders.
 - Row-level security.
 
-## 11. Remaining implementation decisions
+## 12. Remaining implementation decisions
 
 The following details remain to be finalised during implementation:
 
-- Initial product seed data.
-- Whether a rejected order should record a reason (currently it does not).
 - Reporting timezone (proposed: `Africa/Johannesburg`, half-open day boundaries).
 - Worker polling interval and shutdown behaviour.
 - Final Docker Compose configuration and application entry point.
