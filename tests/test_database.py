@@ -16,6 +16,7 @@ def test_schema_initialisation_is_idempotent():
     database_url = os.environ["DATABASE_URL"]
 
     initialise_database(database_url)
+    initialise_database(database_url)
 
     with psycopg.connect(database_url) as connection:
         rows = connection.execute(
