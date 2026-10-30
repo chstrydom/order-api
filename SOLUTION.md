@@ -30,13 +30,14 @@ This document records the requirements, assumptions, design decisions, and trade
 - The daily report is the selected extension option (Option B).
 - The database-backed processing queue is polled by a background worker.
 - Authentication and authorisation are out of scope for this exercise.
-- Insufficient stock policy: An order requesting more stock than is available is rejected. No stock is deducted, and the rejection is persisted as the order's terminal processing outcome. Partial fulfilment and waiting for future stock availability are out of scope. Replenishment and order cancellation are also out of scope.
+- Insufficient stock policy: An order requesting more stock than is available is rejected. No stock is deducted, and the rejection is persisted as the order's terminal processing outcome. Partial fulfilment and waiting for future stock availability are out of scope.
+- An order reference identifies a single order submission. A new attempt after rejection must use a new order reference.
 
 ## 2. Technology choices
 
 ### Python and FastAPI
 
-Python 3.14 is the selected runtime because it is available in the development environment. Dependency compatibility will be verified through installation and tests.
+Python 3.14 is the selected runtime because it is available in the development environment. Dependency compatibility is verified through installation and tests.
 
 FastAPI provides typed request and response models, input validation, generated OpenAPI documentation, and a straightforward testing interface.
 
@@ -44,7 +45,9 @@ FastAPI background tasks alone are not used as the durable processing mechanism.
 
 ### PostgreSQL and psycopg
 
-PostgreSQL provides durable storage, unique constraints, transactions, and concurrency controls needed for order intake and stock processing.
+PostgreSQL 17, using the official Docker image, provides a predictable development and test environment without relying on the mutable `latest` tag.
+
+PostgreSQL provides the transactional guarantees, row-level locking, constraints, and aggregation required for reliable stock processing and reporting.
 
 The application uses psycopg with explicit SQL rather than an ORM. This keeps the data access behaviour visible and allows the implementation to demonstrate transaction boundaries, constraints, and stock updates directly.
 
@@ -52,26 +55,27 @@ SQL will be kept in focused data-access functions rather than embedded indiscrim
 
 ## 3. Data model
 
-The proposed core entities are:
+The core entities are:
 
-| Entity | Purpose | Proposed fields |
+| Entity | Purpose | Fields |
 |---|---|---|
-| Product | Current product and stock information | `sku`, `name`, `unit_price`, `stock_quantity` |
-| Order | Order identity, total, and processing status | `order_ref`, `customer_id`, `total`, `created_at`, `status` |
-| OrderLine | Products and quantities captured for an order | `order_ref`, `sku`, `quantity`, `unit_price` |
+| Product | Current product and stock information | `sku`, `name`, `price_cents`, `stock` |
+| Order | Order identity, total, and processing status | `order_ref`, `customer_id`, `total_cents`, `created_at`, `status` |
+| OrderLine | Products and quantities captured for an order | `order_ref`, `sku`, `qty`, `price_cents` |
 
 ### Data-model decisions
 
-- `order_ref` is unique and identifies an order submission.
+- `order_ref` is the primary key of an order and identifies a unique submission.
 - The order line stores the unit price used when the order was created. Later product price changes must not change historical order totals.
 - Order creation time is stored for processing order and daily reporting.
 - Order status represents the processing outcome.
 - The order and its lines are persisted together in a transaction.
-- The database schema and initialisation or migration approach still need to be implemented.
+- Product deletion is restricted when historical order lines reference it (`ON DELETE RESTRICT`), preserving order history.
+- Order-line quantities for duplicate SKUs in the same request are consolidated before persistence.
+- Monetary values use integer (BIGINT) cents throughout the database and business calculations. This avoids floating-point precision issues in monetary calculations.
+- Database constraints enforce basic data validity independently of application-level validation.
 
 The draft does not include a separate log table because application logging is outside the current scope. Operational errors can be reported through standard application logging.
-
-If an order can contain the same SKU on multiple input lines, the implementation must define whether those quantities are consolidated or represented as separate lines. The simpler initial contract is to consolidate quantities by SKU before persistence.
 
 ## 4. API contract
 
@@ -94,6 +98,12 @@ If an order can contain the same SKU on multiple input lines, the implementation
 
 The implementation must ensure that validation and persistence failures do not leave a partially created order.
 
+### Considerations
+
+The API resolves prices from product records when accepting an order, then snapshots those prices into `order_lines`.
+
+An accepted order is not necessarily a fulfilled order. The response and subsequent order retrieval must distinguish between successful intake and completed stock processing.
+
 ## 5. Order intake and stock processing
 
 ### Durable order intake
@@ -102,7 +112,7 @@ Order intake and stock processing are separate stages.
 
 1. Validate the request and resolve product prices.
 2. Persist the order and its lines in a single transaction.
-3. Mark the order as awaiting stock processing.
+3. Set the initial order status to `RECEIVED`.
 4. Return the persisted order to the caller.
 5. A background worker polls outstanding orders and attempts stock processing.
 6. The worker records the final processing outcome.
@@ -110,6 +120,18 @@ Order intake and stock processing are separate stages.
 This design allows order intake to continue while the worker is temporarily stopped, provided PostgreSQL and the API remain available.
 
 An order accepted by the intake API is not necessarily a successfully fulfilled order. Its status must make that distinction clear.
+
+### Order statuses
+
+| Status | Meaning |
+|---|---|
+| `RECEIVED` | Order is durably persisted and awaiting stock processing. |
+| `PROCESSED` | Stock was successfully deducted for all order lines. |
+| `REJECTED` | Stock was insufficient for at least one order line; no stock was deducted. |
+
+`PROCESSED` and `REJECTED` are terminal outcomes for the order reference.
+
+An identical retry of a rejected order returns the existing rejected order. It does not automatically attempt processing again.
 
 ### Database-backed work polling
 
@@ -132,13 +154,79 @@ Within one database transaction, the worker must:
 
 The order status update and any stock deductions must commit together. If a database error occurs during processing, the transaction must roll back so that a retry cannot repeat a partially applied stock deduction.
 
-A rejected order is a terminal outcome for that `order_ref`. Retrying the original request returns the existing rejected order; it does not automatically attempt processing again.
-
 Concurrent orders competing for the same stock must be handled using appropriate database locking or conditional updates. Application-side stock checks alone are insufficient.
 
-## 6. Daily report
+## 6. Database schema
 
-The daily report is the selected extension option.
+The database consists of three tables:
+
+### Products
+
+| Column | PostgreSQL type | Constraints |
+|---|---|---|
+| `sku` | TEXT | Primary key |
+| `name` | TEXT | NOT NULL |
+| `price_cents` | BIGINT | NOT NULL, CHECK (`price_cents >= 0`) |
+| `stock` | INTEGER | NOT NULL, CHECK (`stock >= 0`) |
+
+### Orders
+
+| Column | PostgreSQL type | Constraints |
+|---|---|---|
+| `order_ref` | TEXT | Primary key |
+| `customer_id` | TEXT | NOT NULL |
+| `total_cents` | BIGINT | NOT NULL, CHECK (`total_cents >= 0`) |
+| `created_at` | TIMESTAMPTZ | NOT NULL, defaults to current timestamp |
+| `status` | TEXT | NOT NULL, restricted to `RECEIVED`, `PROCESSED`, `REJECTED` |
+
+### Order lines
+
+| Column | PostgreSQL type | Constraints |
+|---|---|---|
+| `order_ref` | TEXT | NOT NULL, foreign key to `orders.order_ref` |
+| `sku` | TEXT | NOT NULL, foreign key to `products.sku` |
+| `qty` | INTEGER | NOT NULL, CHECK (`qty > 0`) |
+| `price_cents` | BIGINT | NOT NULL, CHECK (`price_cents >= 0`) |
+
+The `order_lines` table has a composite primary key on (`order_ref`, `sku`), preventing duplicate SKU lines within an order.
+
+Both foreign keys use `ON DELETE RESTRICT`.
+
+### Relationships
+
+```text
+products
+   |
+   | sku
+   |
+   v
+order_lines -------- orders
+     |                   |
+     +---- order_ref ----+
+```
+
+### Database constraints
+
+1. Product prices cannot be negative.
+2. Product stock cannot be negative.
+3. Order-line quantities must be greater than zero.
+4. Order totals cannot be negative.
+5. Product SKU is unique and cannot be null.
+6. Order reference is unique and cannot be null.
+7. Order lines have a composite primary key on (`order_ref`, `sku`).
+8. Order lines reference both their order and product.
+9. Both foreign keys restrict deletion of referenced records.
+10. Monetary values use integer cents.
+
+### Schema initialisation
+
+The schema is maintained in `src/order_api/db/schema.sql` and initialised through the database module.
+
+`CREATE TABLE IF NOT EXISTS` allows initialisation to be repeated without failing when tables already exist. It does not apply changes to existing tables. Schema changes to an existing database will require an appropriate migration or a fresh database.
+
+## 7. Daily report
+
+The daily report is the selected extension option (Option B).
 
 The endpoint will report for the requested calendar date:
 
@@ -150,11 +238,15 @@ The endpoint will report for the requested calendar date:
 
 Revenue and units sold reflect successful stock processing, not merely order intake. Current stock represents the latest stock level at the time the report is generated; it is not a historical end-of-day stock snapshot.
 
-The reporting date boundary and timezone must be documented and applied consistently. The report must also define whether the requested date filters order creation time or processing time. For this design, the initial choice is order creation date, with revenue and units sold including only orders created on that date that have reached `PROCESSED` status by the time the report is generated.
+The reporting date filters orders by creation date, not processing date.
 
-## 7. Code organisation
+Revenue and units sold include only orders created on the requested date that have reached `PROCESSED` status by the time the report is generated.
 
-The implementation will use a small separation of responsibilities:
+The reporting timezone must be documented and applied consistently when determining the calendar-day boundaries.
+
+## 8. Code organisation
+
+The implementation uses a small separation of responsibilities:
 
 - **API routes:** HTTP request handling, response formatting, and input/output models.
 - **Business logic:** order rules, idempotency behaviour, and stock-processing decisions.
@@ -163,7 +255,7 @@ The implementation will use a small separation of responsibilities:
 
 The separation should make business rules testable without requiring every test to exercise the HTTP layer. Additional abstractions will be introduced only when they provide a clear benefit.
 
-## 8. Testing strategy
+## 9. Testing strategy
 
 Tests will cover:
 
@@ -180,7 +272,9 @@ Tests will cover:
 
 The two required unhappy-path demonstrations are duplicate submission and temporary stock-processing interruption followed by catch-up.
 
-## 9. Out of scope
+Database tests also verify the connection, schema initialisation, and database-enforced constraints.
+
+## 10. Out of scope
 
 - Order cancellation.
 - Stock replenishment.
@@ -192,14 +286,14 @@ The two required unhappy-path demonstrations are duplicate submission and tempor
 - Price refresh for existing orders.
 - Row-level security.
 
-## 10. Remaining implementation decisions
+## 11. Remaining implementation decisions
 
-- Database schema creation and migration strategy.
+The following details remain to be finalised during implementation:
+
 - Initial product seed data.
-- Exact order status names and transitions.
 - Final API request and response shapes.
-- Reporting timezone and revenue definition.
+- Reporting timezone.
 - Worker polling interval and shutdown behaviour.
 - Final Docker Compose configuration and application entry point.
 
-These decisions will be settled before or during implementation and reflected in the tests and README.
+These decisions will be reflected in the implementation, tests, and README as they are settled.
