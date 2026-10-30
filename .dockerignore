@@ -8,4 +8,4 @@ __pycache__
 .pytest_cache
 .ruff_cache
 tests
-worker_control
+worker_pause

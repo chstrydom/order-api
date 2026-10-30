@@ -1,4 +1,3 @@
-
 # Environment and secrets
 .env
 .venv/
@@ -18,6 +17,6 @@ wheels/
 htmlcov/
 
 # Worker pause sentinel and runtime control files
-worker_control/*
-!worker_control/.gitkeep
+worker_pause/*
+!worker_pause/.gitkeep
 .worker_paused
