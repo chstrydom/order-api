@@ -1,12 +1,17 @@
 import psycopg
 
 from order_api.orders.exceptions import (
+    InvalidOrderError,
     OrderConflictError,
     UnknownProductError,
 )
+from order_api.orders.schemas import MAX_QTY
 
 
 def _normalise_items(items: list[dict]) -> dict[str, int]:
+    """Combine duplicate SKUs. The result is sorted by SKU, so order lines (and
+    the `items` in responses) are always returned in SKU order, not submission
+    order."""
     quantities: dict[str, int] = {}
 
     for item in items:
@@ -16,7 +21,7 @@ def _normalise_items(items: list[dict]) -> dict[str, int]:
     return dict(sorted(quantities.items()))
 
 
-def _get_existing_order(cursor, order_ref: str) -> dict | None:
+def _get_existing_order(cursor: psycopg.Cursor, order_ref: str) -> dict | None:
     cursor.execute(
         """
         SELECT order_ref, customer_id, total_cents, status
@@ -63,10 +68,7 @@ def _is_same_submission(
     customer_id: str,
     quantities: dict[str, int],
 ) -> bool:
-    existing_quantities = {
-        item["sku"]: item["qty"]
-        for item in existing_order["items"]
-    }
+    existing_quantities = {item["sku"]: item["qty"] for item in existing_order["items"]}
 
     return (
         existing_order["customer_id"] == customer_id
@@ -83,49 +85,49 @@ def create_order(
     quantities = _normalise_items(items)
 
     if not quantities:
-        raise ValueError("An order must contain at least one item.")
+        raise InvalidOrderError("An order must contain at least one item.")
 
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            # Check for an existing submission first.
-            existing = _get_existing_order(cursor, order_ref)
+    too_large = [sku for sku, qty in quantities.items() if qty > MAX_QTY]
+    if too_large:
+        raise InvalidOrderError(
+            f"Combined quantity exceeds {MAX_QTY} for SKU(s): {', '.join(too_large)}"
+        )
 
-            if existing is not None:
-                if _is_same_submission(existing, customer_id, quantities):
-                    return existing
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        # Check for an existing submission first.
+        existing = _get_existing_order(cursor, order_ref)
 
-                raise OrderConflictError(order_ref)
+        if existing is not None:
+            if _is_same_submission(existing, customer_id, quantities):
+                return existing
 
-            # Resolve current product prices in one query.
-            cursor.execute(
-                """
+            raise OrderConflictError(order_ref)
+
+        # Resolve current product prices in one query. FOR KEY SHARE keeps the
+        # rows from being deleted but does not block the worker's stock updates.
+        cursor.execute(
+            """
                 SELECT sku, price_cents
                 FROM products
                 WHERE sku = ANY(%s)
                 ORDER BY sku
-                FOR SHARE
+                FOR KEY SHARE
                 """,
-                (list(quantities),),
-            )
-            products = {
-                row[0]: row[1]
-                for row in cursor.fetchall()
-            }
+            (list(quantities),),
+        )
+        products = {row[0]: row[1] for row in cursor.fetchall()}
 
-            missing_skus = set(quantities) - set(products)
+        missing_skus = set(quantities) - set(products)
 
-            if missing_skus:
-                raise UnknownProductError(
-                    f"Unknown product SKU(s): {', '.join(sorted(missing_skus))}"
-                )
-
-            total_cents = sum(
-                products[sku] * qty
-                for sku, qty in quantities.items()
+        if missing_skus:
+            raise UnknownProductError(
+                f"Unknown product SKU(s): {', '.join(sorted(missing_skus))}"
             )
 
-            cursor.execute(
-                """
+        total_cents = sum(products[sku] * qty for sku, qty in quantities.items())
+
+        cursor.execute(
+            """
                 INSERT INTO orders (
                     order_ref, customer_id, total_cents, status
                 )
@@ -133,46 +135,51 @@ def create_order(
                 ON CONFLICT (order_ref) DO NOTHING
                 RETURNING order_ref
                 """,
-                (order_ref, customer_id, total_cents),
-            )
+            (order_ref, customer_id, total_cents),
+        )
 
-            inserted = cursor.fetchone()
+        inserted = cursor.fetchone()
 
-            if inserted is None:
-                # Another request may have inserted this reference meanwhile.
-                existing = _get_existing_order(cursor, order_ref)
+        if inserted is None:
+            # Another request may have inserted this reference meanwhile.
+            existing = _get_existing_order(cursor, order_ref)
 
-                if existing is not None and _is_same_submission(
-                    existing, customer_id, quantities
-                ):
-                    return existing
+            if existing is not None and _is_same_submission(
+                existing, customer_id, quantities
+            ):
+                return existing
 
-                raise OrderConflictError(order_ref)
+            raise OrderConflictError(order_ref)
 
-            cursor.executemany(
-                """
+        # Only the transaction that inserted the order row reaches this point;
+        # a concurrent duplicate waits on the order's primary key and takes the
+        # branch above, so order_lines cannot hit a primary-key race.
+        cursor.executemany(
+            """
                 INSERT INTO order_lines (
                     order_ref, sku, qty, price_cents
                 )
                 VALUES (%s, %s, %s, %s)
                 """,
-                [
-                    (order_ref, sku, qty, products[sku])
-                    for sku, qty in quantities.items()
-                ],
-            )
+            [(order_ref, sku, qty, products[sku]) for sku, qty in quantities.items()],
+        )
 
-            return {
-                "order_ref": order_ref,
-                "customer_id": customer_id,
-                "total_cents": total_cents,
-                "status": "RECEIVED",
-                "items": [
-                    {
-                        "sku": sku,
-                        "qty": qty,
-                        "price_cents": products[sku],
-                    }
-                    for sku, qty in quantities.items()
-                ],
-            }
+        return {
+            "order_ref": order_ref,
+            "customer_id": customer_id,
+            "total_cents": total_cents,
+            "status": "RECEIVED",
+            "items": [
+                {
+                    "sku": sku,
+                    "qty": qty,
+                    "price_cents": products[sku],
+                }
+                for sku, qty in quantities.items()
+            ],
+        }
+
+
+def get_order_by_ref(database_url: str, order_ref: str) -> dict | None:
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        return _get_existing_order(cursor, order_ref)

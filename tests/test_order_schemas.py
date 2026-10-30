@@ -43,3 +43,28 @@ def test_order_request_rejects_blank_sku():
             customer_id="CUST-001",
             items=[{"sku": "  ", "qty": 1}],
         )
+
+
+def test_order_request_rejects_consolidated_quantity_over_limit():
+    with pytest.raises(ValidationError):
+        CreateOrderRequest(
+            order_ref="ORD-001",
+            customer_id="CUST-001",
+            items=[
+                {"sku": "sku-1", "qty": 600_000},
+                {"sku": "sku-1", "qty": 600_000},
+            ],
+        )
+
+
+def test_order_request_accepts_large_quantities_on_different_skus():
+    request = CreateOrderRequest(
+        order_ref="ORD-001",
+        customer_id="CUST-001",
+        items=[
+            {"sku": "sku-1", "qty": 600_000},
+            {"sku": "sku-2", "qty": 600_000},
+        ],
+    )
+
+    assert len(request.items) == 2

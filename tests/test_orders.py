@@ -1,39 +1,16 @@
-import os
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 import pytest
 
-from order_api.db import initialise_database
 from order_api.orders.exceptions import (
+    InvalidOrderError,
     OrderConflictError,
     UnknownProductError,
 )
 from order_api.orders.repository import create_order
 
-
-@pytest.fixture
-def database_url():
-    url = os.environ["DATABASE_URL"]
-    initialise_database(url)
-
-    with psycopg.connect(url) as connection:
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                """
-                INSERT INTO products (sku, name, price_cents, stock)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (sku) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    price_cents = EXCLUDED.price_cents,
-                    stock = EXCLUDED.stock
-                """,
-                [
-                    ("order-sku-1", "Product 1", 1000, 10),
-                    ("order-sku-2", "Product 2", 2500, 5),
-                ],
-            )
-
-    return url
+pytestmark = pytest.mark.usefixtures("order_products")
 
 
 def test_create_order_persists_order_and_price_snapshots(database_url):
@@ -160,6 +137,7 @@ def test_retry_preserves_original_price_snapshot(database_url):
     assert retry["total_cents"] == 2000
     assert retry["items"][0]["price_cents"] == 1000
 
+
 def test_order_intake_does_not_deduct_stock(database_url):
     create_order(
         database_url,
@@ -175,6 +153,7 @@ def test_order_intake_does_not_deduct_stock(database_url):
         ).fetchone()[0]
 
     assert stock == 10
+
 
 def test_order_with_unknown_sku_does_not_persist_partial_lines(database_url):
     with pytest.raises(UnknownProductError):
@@ -196,3 +175,84 @@ def test_order_with_unknown_sku_does_not_persist_partial_lines(database_url):
 
     assert result == 0
 
+
+def test_concurrent_identical_submissions_create_one_order(database_url):
+    def submit(_):
+        return create_order(
+            database_url,
+            "ORD-CONCURRENT-001",
+            "CUST-001",
+            [{"sku": "order-sku-1", "qty": 1}],
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(submit, range(8)))
+
+    assert all(result == results[0] for result in results)
+
+    with psycopg.connect(database_url) as connection:
+        orders = connection.execute(
+            "SELECT COUNT(*) FROM orders WHERE order_ref = %s",
+            ("ORD-CONCURRENT-001",),
+        ).fetchone()[0]
+        lines = connection.execute(
+            "SELECT COUNT(*) FROM order_lines WHERE order_ref = %s",
+            ("ORD-CONCURRENT-001",),
+        ).fetchone()[0]
+
+    assert (orders, lines) == (1, 1)
+
+
+def test_concurrent_conflicting_submissions_have_one_winner(database_url):
+    def submit(qty):
+        try:
+            create_order(
+                database_url,
+                "ORD-CONCURRENT-002",
+                "CUST-001",
+                [{"sku": "order-sku-1", "qty": qty}],
+            )
+        except OrderConflictError:
+            return "conflict"
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(submit, [1, 2, 3, 4]))
+
+    assert outcomes.count("ok") == 1
+    assert outcomes.count("conflict") == 3
+
+
+def test_items_are_returned_in_sku_order_not_submission_order(database_url):
+    order = create_order(
+        database_url,
+        "ORD-SORTED-001",
+        "CUST-001",
+        [
+            {"sku": "order-sku-2", "qty": 1},
+            {"sku": "order-sku-1", "qty": 1},
+        ],
+    )
+
+    assert [item["sku"] for item in order["items"]] == ["order-sku-1", "order-sku-2"]
+
+
+def test_consolidated_quantity_over_limit_is_rejected(database_url):
+    with pytest.raises(InvalidOrderError):
+        create_order(
+            database_url,
+            "ORD-LIMIT-001",
+            "CUST-001",
+            [
+                {"sku": "order-sku-1", "qty": 600_000},
+                {"sku": "order-sku-1", "qty": 600_000},
+            ],
+        )
+
+    with psycopg.connect(database_url) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM orders WHERE order_ref = %s",
+            ("ORD-LIMIT-001",),
+        ).fetchone()[0]
+
+    assert count == 0

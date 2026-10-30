@@ -33,27 +33,15 @@ This document records the requirements, assumptions, design decisions, and trade
 - Insufficient stock policy: An order requesting more stock than is available is rejected. No stock is deducted, and the rejection is persisted as the order's terminal processing outcome. Partial fulfilment and waiting for future stock availability are out of scope.
 - An order reference identifies a single order submission. A new attempt after rejection must use a new order reference.
 
-|   Area	|   Status  |
-|   -   | - |
-|   PostgreSQL schema and initialisation	|   Implemented  |
-|   Product data access	|   Implemented  |
-|   Order request validation	|   Implemented  |
-|   Order intake and persistence	|   Implemented  |
-|   Duplicate SKU consolidation	|   Implemented  |
-|   Idempotent order submission	|   Implemented  |
-|   Order-line price snapshots	|   Implemented  |
-|   Unknown-product handling	|   Implemented  |
-|   FastAPI routes	|   Pending  |
-|   Stock-processing worker	|   Pending  |
-|   Transactional stock deduction	|   Pending  |
-|   Daily report	|   Pending  |
-|   Application containerisation	|   Pending  |
+Implementation status is tracked in the README so that there is a single source of truth.
 
 ## 2. Technology choices
 
 ### Python and FastAPI
 
-Python 3.14 is the selected runtime because it is available in the development environment. The selected dependencies have been installed and verified through the current automated test suite.
+Route handlers are synchronous (`def`), so FastAPI runs them in a threadpool. Each request opens its own database connection; a connection pool is the upgrade path if load requires it.
+
+Python 3.14 is the selected runtime because it is available in the development environment. Ruff targets the same version. The selected dependencies have been installed and verified through the current automated test suite.
 
 FastAPI provides typed request and response models, input validation, generated OpenAPI documentation, and a straightforward testing interface.
 
@@ -104,7 +92,7 @@ The draft does not include a separate log table because application logging is o
 
 ### Expected HTTP behaviour
 
-- `POST /orders` returns `201 Created` for a newly persisted order.
+- `POST /orders` returns `202 Accepted` with a `Location: /orders/{order_ref}` header: the order is durably persisted, but stock processing happens asynchronously. An identical retry also returns `202` with the existing order.
 - An identical retry using an existing `order_ref` returns the existing order and its current persisted status, without creating another order or triggering stock processing again.
 - Reusing an existing `order_ref` with a different payload returns `409 Conflict`.
 - A new attempt after a rejected order must use a new `order_ref`.
@@ -134,8 +122,8 @@ Order intake and stock processing are separate stages.
 6. The worker records the final processing outcome.
 
 ### Order intake guarantees
-- Duplicate SKUs in a request are consolidated into one order line, with quantities added together.
-- Product prices are resolved and locked for the duration of the intake transaction before the order is persisted.
+- Duplicate SKUs in a request are consolidated into one order line, with quantities added together. The 1,000,000 per-line quantity limit applies to the consolidated quantity, and is checked in request validation (422) and again in the repository.
+- Product prices are resolved and the product rows are locked with `FOR KEY SHARE` for the duration of the intake transaction. This prevents deletion of the product without blocking the worker's stock updates.
 - The order total is calculated using The captured unit prices and consolidated quantities.
 - The order and all order lines are inserted within one transaction.
 - If any requested SKU does not exist, order creation fails without persisting a partial order.
@@ -298,21 +286,24 @@ Implemented tests
 - Unknown product handling.
 - No stock deduction during order intake.
 - Atomic order creation when a requested SKU is unknown.
+- Concurrent identical submissions produce exactly one order; concurrent conflicting submissions have exactly one winner.
+- HTTP behaviour for order creation, retrieval, duplicate and conflicting submissions, unknown SKUs, and invalid requests (422).
+- Database constraints: non-negative stock, order-line foreign keys, valid order status.
 
 Remaining tests
-- Order retrieval through the API.
+- A rejected order does not currently record a reason.
 - Sufficient and insufficient stock processing.
 - Concurrent orders competing for limited stock.
 - Transaction rollback during stock processing.
 - Worker interruption and recovery.
 - Daily report calculations and status filtering.
-- HTTP response behaviour.
+- HTTP behaviour for the daily report.
 
 The two required unhappy-path demonstrations are duplicate submission and temporary stock-processing interruption followed by catch-up.
 
-Database tests also verify the connection, schema initialisation, and database-enforced constraints.
+Every test starts from empty tables. The test suite refuses to run unless the database name ends in `_test`.
 
-The current automated test suite contains 20 passing tests covering the implemented database, product-repository, order-repository, and request-validation functionality.
+The automated test suite covers the implemented database constraints, product and order repositories, request validation, concurrent duplicate submissions, and the HTTP API. Run `uv run pytest` for the current count.
 
 ## 10. Out of scope
 
@@ -331,8 +322,8 @@ The current automated test suite contains 20 passing tests covering the implemen
 The following details remain to be finalised during implementation:
 
 - Initial product seed data.
-- Final API request and response shapes.
-- Reporting timezone.
+- Whether a rejected order should record a reason (currently it does not).
+- Reporting timezone (proposed: `Africa/Johannesburg`, half-open day boundaries).
 - Worker polling interval and shutdown behaviour.
 - Final Docker Compose configuration and application entry point.
 

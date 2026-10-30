@@ -1,30 +1,32 @@
 import os
 
 import psycopg
+import pytest
 
-from order_api.db import initialise_database
+from order_api.products.repository import get_product_by_sku, get_products_by_skus
 
 
-def test_get_product_by_sku():
-    database_url = os.environ["DATABASE_URL"]
-    initialise_database(database_url)
-
-    with psycopg.connect(database_url) as connection:
-        connection.execute(
+@pytest.fixture
+def seeded_products():
+    with (
+        psycopg.connect(os.environ["DATABASE_URL"]) as connection,
+        connection.cursor() as cursor,
+    ):
+        cursor.executemany(
             """
             INSERT INTO products (sku, name, price_cents, stock)
             VALUES (%s, %s, %s, %s)
-            ON CONFLICT (sku) DO UPDATE SET
-                name = EXCLUDED.name,
-                price_cents = EXCLUDED.price_cents,
-                stock = EXCLUDED.stock
             """,
-            ("sku-1", "Product 1", 1999, 10),
+            [
+                ("sku-1", "Product 1", 1999, 10),
+                ("sku-2", "Product 2", 2500, 5),
+                ("sku-3", "Product 3", 3500, 8),
+            ],
         )
 
-    from order_api.products.repository import get_product_by_sku
 
-    product = get_product_by_sku(database_url, "sku-1")
+def test_get_product_by_sku(seeded_products):
+    product = get_product_by_sku(os.environ["DATABASE_URL"], "sku-1")
 
     assert product == {
         "sku": "sku-1",
@@ -35,40 +37,12 @@ def test_get_product_by_sku():
 
 
 def test_get_product_by_unknown_sku_returns_none():
-    database_url = os.environ["DATABASE_URL"]
-    initialise_database(database_url)
-
-    from order_api.products.repository import get_product_by_sku
-
-    product = get_product_by_sku(database_url, "does-not-exist")
-
-    assert product is None
+    assert get_product_by_sku(os.environ["DATABASE_URL"], "does-not-exist") is None
 
 
-def test_get_products_by_skus_returns_existing_products():
-    database_url = os.environ["DATABASE_URL"]
-    initialise_database(database_url)
-
-    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
-        cursor.executemany(
-            """
-                INSERT INTO products (sku, name, price_cents, stock)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (sku) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    price_cents = EXCLUDED.price_cents,
-                    stock = EXCLUDED.stock
-                """,
-            [
-                ("sku-2", "Product 2", 2500, 5),
-                ("sku-3", "Product 3", 3500, 8),
-            ],
-        )
-
-    from order_api.products.repository import get_products_by_skus
-
+def test_get_products_by_skus_returns_existing_products(seeded_products):
     products = get_products_by_skus(
-        database_url,
+        os.environ["DATABASE_URL"],
         ["sku-1", "sku-2", "sku-missing"],
     )
 
@@ -79,23 +53,11 @@ def test_get_products_by_skus_returns_existing_products():
 
 
 def test_get_products_by_empty_sku_list_returns_empty_list():
-    from order_api.products.repository import get_products_by_skus
-
-    result = get_products_by_skus(
-        os.environ["DATABASE_URL"],
-        [],
-    )
-
-    assert result == []
+    assert get_products_by_skus(os.environ["DATABASE_URL"], []) == []
 
 
-def test_get_products_by_skus_handles_duplicate_skus():
-    from order_api.products.repository import get_products_by_skus
-
-    products = get_products_by_skus(
-        os.environ["DATABASE_URL"],
-        ["sku-1", "sku-1"],
-    )
+def test_get_products_by_skus_handles_duplicate_skus(seeded_products):
+    products = get_products_by_skus(os.environ["DATABASE_URL"], ["sku-1", "sku-1"])
 
     assert len(products) == 1
     assert products[0]["sku"] == "sku-1"
