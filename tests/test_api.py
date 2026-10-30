@@ -160,3 +160,23 @@ def test_consolidated_quantity_over_limit_returns_422(test_product):
     }
 
     assert client.post("/orders", json=payload).status_code == 422
+
+
+def test_daily_report_returns_report_for_the_requested_date(test_product):
+    response = client.get("/reports/daily", params={"date": "2026-10-30"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["date"] == "2026-10-30"
+    assert body["timezone"] == "Africa/Johannesburg"
+    assert body["orders_total"] == 0
+    assert body["skus"] == [
+        {"sku": "TEST-001", "units_sold": 0, "revenue_cents": 0, "current_stock": 10}
+    ]
+
+
+def test_daily_report_requires_a_valid_date():
+    assert client.get("/reports/daily").status_code == 422
+    assert (
+        client.get("/reports/daily", params={"date": "not-a-date"}).status_code == 422
+    )
