@@ -106,3 +106,38 @@ def test_pause_sentinel_holds_orders_until_it_is_removed(database_url, start_wor
     sentinel.unlink()
 
     assert _wait_until(lambda: set(_statuses(database_url).values()) == {"PROCESSED"})
+
+
+def test_stop_event_ends_the_loop_promptly(database_url, start_worker):
+    _, stop_event, thread, _ = start_worker()
+    time.sleep(0.1)
+
+    stop_event.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+
+
+def test_worker_survives_a_database_error_and_retries(
+    database_url, start_worker, monkeypatch
+):
+    _submit(database_url, "ORD-RETRY-001")
+
+    real_process = runner.process_one_order
+    calls = {"n": 0}
+
+    def flaky(url):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise psycopg.OperationalError("database unavailable")
+        return real_process(url)
+
+    monkeypatch.setattr(runner, "process_one_order", flaky)
+
+    _, _, thread, _ = start_worker()
+
+    assert _wait_until(
+        lambda: _statuses(database_url).get("ORD-RETRY-001") == "PROCESSED"
+    )
+    assert thread.is_alive()
+    assert calls["n"] >= 3

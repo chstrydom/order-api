@@ -1,19 +1,23 @@
+
+# Environment and secrets
+.env
+.venv/
+
 # Python-generated files
 __pycache__/
-*.py[oc]
+*.py[cod]
 build/
 dist/
 wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Environment file
-.env
+*.egg-info/
 
 # Test and tooling caches
 .pytest_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# Worker pause sentinel and runtime control files
+worker_control/*
+!worker_control/.gitkeep
+.worker_paused
