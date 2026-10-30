@@ -9,11 +9,49 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Creates the order_api_test database on first start of a fresh volume.
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U order_api -d order_api"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://order_api:${POSTGRES_PASSWORD:-local_dev_password}@db:5432/order_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    build: .
+    command: ["python", "-m", "order_api.worker"]
+    environment:
+      DATABASE_URL: postgresql://order_api:${POSTGRES_PASSWORD:-local_dev_password}@db:5432/order_api
+      WORKER_POLL_INTERVAL: "1"
+      # Sentinel filename matches scripts/seed_and_burst.py's default.
+      # Create ./worker_pause/.worker_paused on the host to pause processing.
+      WORKER_PAUSE_SENTINEL: /worker_pause/.worker_paused
+    volumes:
+      - ./worker_pause:/worker_pause:ro
+    # The API creates the schema on startup, so wait for it to be healthy.
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 15s
 
 volumes:
   postgres_data:

@@ -88,7 +88,8 @@ The draft does not include a separate log table because application logging is o
 | `POST /orders` | Create an order |
 | `GET /orders/{order_ref}` | Retrieve an order, its lines, and its status |
 | `GET /products/{sku}` | Retrieve product details and current stock |
-| `GET /reports/daily?date=YYYY-MM-DD` | Retrieve the daily report (planned) |
+| `GET /reports/daily?date=YYYY-MM-DD` | Retrieve the daily report |
+
 ### Expected HTTP behaviour
 
 - `POST /orders` returns `202 Accepted` with a `Location: /orders/{order_ref}` header: the order is durably persisted, but stock processing happens asynchronously. An identical retry also returns `202` with the existing order.
@@ -121,6 +122,7 @@ Order intake and stock processing are separate stages.
 6. The worker records the final processing outcome.
 
 ### Order intake guarantees
+
 - Duplicate SKUs in a request are consolidated into one order line, with quantities added together. The 1,000,000 per-line quantity limit applies to the consolidated quantity, and is checked in request validation (422) and again in the repository.
 - Product prices are resolved and the product rows are locked with `FOR KEY SHARE` for the duration of the intake transaction. This prevents deletion of the product without blocking the worker's stock updates.
 - The order total is calculated using the captured unit prices and consolidated quantities.
@@ -143,7 +145,7 @@ Order acceptance means that the Orders capability has validated and durably pers
 
 `PROCESSED` and `REJECTED` are terminal outcomes for the order reference.
 
-An identical retry of a rejected order returns the existing rejected order. It does not automatically attempt processing again.
+An identical retry of a rejected order returns the existing rejected order. It does not automatically attempt processing again. A rejected order does not record why it was rejected.
 
 ### Database-backed work polling
 
@@ -153,9 +155,11 @@ The worker polls the orders table for eligible outstanding work. This is a datab
 
 Two workers cannot process the same order concurrently: the claim uses `FOR UPDATE SKIP LOCKED`, and a processed order no longer matches `status = 'RECEIVED'`.
 
-### Pause/resume for demonstration (planned)
+### Worker runner and pause/resume for demonstration
 
-The worker runner will check for a sentinel file (path from `WORKER_PAUSE_SENTINEL`, default `.worker_paused`) on each poll, and skip processing while it exists. The check lives in the polling loop, not in `process_one_order`, which always processes when called. This lets `scripts/seed_and_burst.py` demonstrate orders being accepted while stock processing is unavailable, and catching up after the sentinel is removed. The sentinel is a demonstration hook, not a production control.
+`worker/runner.py` repeatedly calls `process_one_order`. While orders are available it processes them back to back; when there are none, or processing is paused, or the database is unavailable, it waits `WORKER_POLL_INTERVAL` seconds (default 1). A `psycopg.Error` is logged and retried on the next cycle: the failed transaction has rolled back, so the order stays `RECEIVED` and is picked up again. On SIGINT or SIGTERM the worker finishes the order it is processing, commits it, and exits.
+
+While the sentinel file (`WORKER_PAUSE_SENTINEL`, default `.worker_paused`) exists, the worker skips processing. The check lives in the polling loop, not in `process_one_order`, which always processes when called. Orders continue to be accepted while paused, and the backlog is processed after the sentinel is removed. This lets `scripts/seed_and_burst.py` demonstrate orders being accepted while stock processing is unavailable, and catching up afterwards. The sentinel is a demonstration hook, not a production control.
 
 ### Transactional stock processing
 
@@ -269,7 +273,7 @@ The report is calculated using the state of the database at generation time. Con
 
 ## 8. Seed and burst
 
-Initial product seed data and a burst of demo orders (including intentional duplicates) are exercised end-to-end by `scripts/seed_and_burst.py`. See the "Burst script" section of README.md for flags and usage. The interruption scenario needs the polling runner and its pause sentinel, so until the runner exists, run with `--skip-interruption`.
+Initial product seed data and a burst of demo orders (including intentional duplicates) are exercised end-to-end by `scripts/seed_and_burst.py`. See the "Burst script" section of README.md for usage. The interruption scenario pauses processing with the sentinel file, submits orders while the worker is paused, then removes the sentinel and waits for the backlog to be processed.
 
 ## 9. Code organisation
 
@@ -278,43 +282,33 @@ The implementation uses a small separation of responsibilities:
 - **API routes:** HTTP request handling, response formatting, and input/output models.
 - **Business logic:** order rules, idempotency behaviour, and stock-processing decisions.
 - **Data access:** explicit SQL, database transactions, and queries.
-- **Worker:** `worker/processor.py` processes a single order transactionally (implemented). The polling runner, with its interval, graceful shutdown and pause sentinel, is not yet implemented.
+- **Worker:** `worker/processor.py` processes a single order transactionally; `worker/runner.py` polls, handles errors and shuts down gracefully.
 
 The separation should make business rules testable without requiring every test to exercise the HTTP layer. Additional abstractions will be introduced only when they provide a clear benefit.
 
 ## 10. Testing strategy
 
 Implemented tests
-- Database connection and schema initialisation.
-- Database-enforced non-negative product stock.
-- Product retrieval by SKU.
-- Multiple product retrieval and missing SKU handling.
-- Order request validation.
-- Successful order persistence.
-- Order total calculation.
-- Duplicate SKU consolidation.
-- Identical submission retry.
-- Conflicting submission using an existing order reference.
-- Product price snapshot preservation.
-- Unknown product handling.
-- No stock deduction during order intake.
-- Atomic order creation when a requested SKU is unknown.
-- Concurrent identical submissions produce exactly one order; concurrent conflicting submissions have exactly one winner.
-- HTTP behaviour for order creation, retrieval, duplicate and conflicting submissions, unknown SKUs, and invalid requests (422).
+- Database connection and idempotent schema initialisation.
 - Database constraints: non-negative stock, order-line foreign keys, valid order status.
-- Sufficient and insufficient stock processing.
+- Product retrieval by SKU, multiple product retrieval and missing SKU handling.
+- Order request validation, including the consolidated quantity limit.
+- Order persistence, total calculation, duplicate SKU consolidation and SKU-ordered output.
+- Identical submission retry, conflicting submission using an existing order reference, and price snapshot preservation.
+- Unknown product handling, no stock deduction during intake, and atomic order creation when a requested SKU is unknown.
+- Concurrent identical submissions produce exactly one order; concurrent conflicting submissions have exactly one winner.
+- HTTP behaviour for order creation, retrieval, duplicate and conflicting submissions, unknown SKUs, invalid requests (422) and the `Location` header.
 - Stock processing: sufficient stock, exact-stock boundary, insufficient stock, no partial deduction when one line is short, no double processing, rejected orders not retried, oldest order first, rollback of stock and status on failure with a clean retry, concurrent workers processing a single order once, and concurrent workers not overselling limited stock.
+- Worker runner: processes a backlog and stops, picks up orders arriving while idle, holds orders while the pause sentinel exists and catches up when it is removed, stops promptly when asked, and survives database errors.
+- Daily report: empty day, status counts versus revenue (processed orders only), revenue from stored line prices, timezone day boundaries, live stock, and HTTP validation.
 
-Remaining tests
-- Worker interruption and recovery (requires the runner).
-- Daily report calculations and status filtering.
-- HTTP behaviour for the daily report.
+Not covered by automated tests: the Docker images and Compose services, and `scripts/seed_and_burst.py`, which are verified manually.
 
 The two required unhappy-path demonstrations are duplicate submission and temporary stock-processing interruption followed by catch-up.
 
 Every test starts from empty tables. The test suite refuses to run unless the database name ends in `_test`.
 
-The automated test suite covers the implemented database constraints, product and order repositories, request validation, concurrent duplicate submissions, and the HTTP API. Run `uv run pytest` for the current count.
+Run `uv run pytest` for the current test count.
 
 ## 11. Out of scope
 
@@ -332,8 +326,4 @@ The automated test suite covers the implemented database constraints, product an
 
 The following details remain to be finalised during implementation:
 
-- Reporting timezone (proposed: `Africa/Johannesburg`, half-open day boundaries).
-- Worker polling interval and shutdown behaviour.
-- Final Docker Compose configuration and application entry point.
-
-These decisions will be reflected in the implementation, tests, and README as they are settled.
+- A rejected order does not record why it was rejected.

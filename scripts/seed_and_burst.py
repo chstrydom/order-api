@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Seed demo products and demonstrate order idempotency and worker recovery.
 
-Run from the repository root:
-
-    uv run python scripts/seed_and_burst.py --skip-interruption
-
-Once the stock worker supports the pause sentinel:
+Run from the repository root, with the API and worker running:
 
     uv run python scripts/seed_and_burst.py
+
+Use --skip-interruption to run only the duplicate-submission demonstration:
+
+    uv run python scripts/seed_and_burst.py --skip-interruption
 
 Each run creates uniquely named demo products and orders. Existing data is
 never overwritten or deleted.
@@ -427,7 +427,7 @@ def main() -> int:
     parser.add_argument(
         "--skip-interruption",
         action="store_true",
-        help="Skip the pause/resume demonstration until the worker exists.",
+        help="Skip the pause/resume demonstration.",
     )
     parser.add_argument(
         "--settle-seconds",

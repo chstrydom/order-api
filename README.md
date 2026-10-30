@@ -11,10 +11,9 @@ Design decisions, assumptions, and trade-offs are documented in [SOLUTION.md](SO
 | Order intake (idempotent, price snapshots, atomic) | Implemented |
 | `GET /orders/{order_ref}`, `GET /products/{sku}`, `GET /health` | Implemented |
 | Stock processor (`process_one_order`) | Implemented |
-| Worker runner (polling, shutdown, Compose service) | Not yet implemented |
-| `GET /reports/daily` | Not yet implemented |
-| Wontainers | Not yet implemented |
-| Seed + burst script (`scripts/seed_and_burst.py`) | Implemented (duplicate demo); interruption phase pending worker |
+| Worker runner (polling, graceful shutdown, pause sentinel) | Implemented |
+| `GET /reports/daily` | Implemented |
+| Docker images and Compose services (`api`, `worker`) | Implemented |
 
 ## Requirements
 
@@ -24,54 +23,66 @@ Design decisions, assumptions, and trade-offs are documented in [SOLUTION.md](SO
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set:
+Copy `.env.example` to `.env`.
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | Database used by the running API |
-| `TEST_DATABASE_URL` | Database used by the tests. The database name must end in `_test`; the test suite refuses to run otherwise because it truncates all tables. |
+| `POSTGRES_PASSWORD` | Database password used by Docker Compose |
+| `DATABASE_URL` | Database for the API and worker when run outside Docker |
+| `TEST_DATABASE_URL` | Database for the tests. The name must end in `_test`; the test suite truncates all tables and refuses to run otherwise. |
+| `WORKER_POLL_INTERVAL` | Seconds the worker waits when there is no work (default `1`) |
+| `WORKER_PAUSE_SENTINEL` | While this file exists the worker does not process orders (default `.worker_paused`) |
 
-Variables already set in the environment take precedence over `.env`.
+Variables already set in the environment take precedence over `.env`. Do not commit `.env`.
 
-Do not commit `.env` or other files containing credentials.
+## Run with Docker (API + worker + database)
+
+```bash
+docker compose up --build
+```
+
+The API is on `http://localhost:8000` (docs at `/docs`). The worker starts once the API is healthy. The test database `order_api_test` is created automatically the first time the database volume is created; on an existing volume, create it manually (see Tests).
 
 ## Run locally
-
-Start PostgreSQL, install dependencies, and start the API:
 
 ```bash
 docker compose up -d db
 uv sync
-uv run uvicorn order_api.main:app --reload
+uv run uvicorn order_api.main:app --reload     # terminal 1
+uv run python -m order_api.worker              # terminal 2
 ```
 
-The schema is created automatically when the API starts.
+## Pause and resume processing (demonstration)
+
+Orders are always accepted; the worker only processes them while the sentinel file does not exist.
+
+```bash
+touch worker_control/paused     # pause: new orders stay RECEIVED
+rm worker_control/paused        # resume: the worker catches up on the backlog
+```
+
+This path is used by Docker Compose. For a local worker, set `WORKER_PAUSE_SENTINEL=worker_control/paused`. Make sure `scripts/seed_and_burst.py` uses the same path.
 
 ## Burst script
 
-`scripts/seed_and_burst.py` seeds demo products and submits a short burst of orders, intentionally including duplicate submissions of the same `order_ref`. Each run uses a unique run ID, so it can be re-run without colliding with earlier data.
+`scripts/seed_and_burst.py` seeds demo products, submits a burst of orders (including intentional duplicates), and demonstrates the interruption scenario: orders are accepted while processing is paused, then processed after resuming. Each run uses a unique run ID, so it can be repeated without colliding with earlier data.
 
-Until the stock-processing worker is implemented, run with `--skip-interruption`:
-
-```bash
-uv run python scripts/seed_and_burst.py --skip-interruption
-```
-
-Once the worker honours the pause sentinel, drop the flag to also demonstrate the interruption/catch-up path:
+**Prerequisites:** the database, API and worker must be running, and `.env` must exist so the script uses the same pause file as the worker (`WORKER_PAUSE_SENTINEL=worker_control/paused`).
 
 ```bash
-uv run python scripts/seed_and_burst.py
+uv run python scripts/seed_and_burst.py                      # full demonstration
+uv run python scripts/seed_and_burst.py --skip-interruption  # duplicates only
 ```
 
 | Flag | Purpose |
 |---|---|
-| `--api-url` | Base URL of the running API (default `http://localhost:8000`, or `$API_URL`). |
-| `--database-url` | Database used only for seeding demo products (default `$DATABASE_URL`). |
-| `--sentinel` | Pause-file path shared with the worker (default `.worker_paused`, or `$WORKER_PAUSE_SENTINEL`). |
-| `--skip-interruption` | Skip the pause/resume phase. Use this until the worker is implemented. |
+| `--api-url` | Base URL of the API (default `http://localhost:8000`, or `$API_URL`). |
+| `--database-url` | Database used only to seed demo products (default `$DATABASE_URL`). |
+| `--sentinel` | Pause-file path shared with the worker (default `$WORKER_PAUSE_SENTINEL`, else `.worker_paused`). |
+| `--skip-interruption` | Skip the pause/resume phase. |
 | `--settle-seconds` | Maximum time to wait for the worker to process orders (default 15). |
 
-The script exits non-zero if any phase fails, so it is safe to run in CI. See [SOLUTION.md](SOLUTION.md) for the pause-sentinel contract.
+The script creates and removes the pause file itself. It exits non-zero if any phase fails.
 
 ## API documentation
 
@@ -82,8 +93,7 @@ Interactive API documentation is available at `http://localhost:8000/docs` while
 | `POST /orders` | `202 Accepted` (order persisted with status `RECEIVED`; an identical retry returns the existing order) | `409` same `order_ref` with a different payload, `404` unknown SKU, `422` invalid request (including a combined quantity over 1,000,000 for one SKU) |
 | `GET /orders/{order_ref}` | `200` | `404` |
 | `GET /products/{sku}` | `200` | `404` |
-
-Orders stay `RECEIVED` until the stock processor runs. The polling worker that runs it automatically is not built yet.
+| `GET /reports/daily?date=YYYY-MM-DD` | `200` | `422` missing or invalid date |
 
 `POST /orders` returns `202` with a `Location` header because stock processing happens asynchronously after the order is stored. See [SOLUTION.md](SOLUTION.md).
 
@@ -105,7 +115,7 @@ Before running tests for the first time:
    docker compose up -d db
    ```
 
-2. Create the test database:
+2. Create the test database (not needed on a fresh volume, where Compose creates it):
 
    ```bash
    docker compose exec db psql -U order_api -d postgres -c "CREATE DATABASE order_api_test;"
@@ -127,8 +137,31 @@ uv run ruff check .
 uv run ruff format .
 ```
 
+## Troubleshooting
+
+**Orders stay `RECEIVED` and the burst script times out** ("Orders did not all reach PROCESSED")
+
+The orders were accepted but nothing is processing them. Check, in order:
+
+1. The worker is running: `docker compose ps` (the `worker` service should be running) and `docker compose logs worker --tail 30`. Without Docker, start it with `uv run python -m order_api.worker`.
+2. No pause file is left over from an earlier run: `ls -la worker_control/ .worker_paused`, then `rm -f worker_control/paused .worker_paused`.
+3. The worker uses the same database as the API (`DATABASE_URL`), not the test database.
+
+Orders left in `RECEIVED` are processed as soon as a working worker starts.
+
+**`service "db" refers to undefined volume postgres_data: invalid compose project`**
+
+`docker-compose.yml` must declare the volume at the top level, at the end of the file:
+
+```yaml
+volumes:
+  postgres_data:
+```
+
+Verify with `docker compose config --quiet`.
+
 ## Scope
 
-The target scope is order creation and retrieval, product stock lookup, asynchronous stock processing with recovery after interruption, and a daily report endpoint. The Status table above shows what is built so far.
+The implementation covers order creation and retrieval, product stock lookup, asynchronous stock processing with recovery after interruption, and a daily report endpoint.
 
-See [SOLUTION.md](SOLUTION.md) for the selected behaviour and remaining assumptions.
+See [SOLUTION.md](SOLUTION.md) for the selected behaviour, trade-offs and known limitations.
