@@ -4,6 +4,10 @@ A Python REST API for order intake, idempotent order creation, stock processing,
 
 Design decisions, assumptions, and trade-offs are documented in [SOLUTION.md](SOLUTION.md). AI assistance is documented in [AI_USAGE.md](AI_USAGE.md).
 
+## Video Walkthrough
+
+https://www.loom.com/share/d9402a975d194b73a00a9f80c580df43
+
 ## Status
 
 | Capability | Status |
