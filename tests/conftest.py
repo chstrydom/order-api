@@ -19,7 +19,17 @@ def load_environment():
         f"Refusing to run tests against non-test database '{database_name}'."
     )
 
-    initialise_database(test_url)
+    try:
+        initialise_database(test_url)
+    except psycopg.OperationalError as exc:
+        pytest.exit(
+            f"Cannot reach the test database at {test_url}.\n"
+            f"Underlying error: {exc}\n"
+            "Start PostgreSQL first:\n"
+            "    docker compose up -d db\n"
+            "then re-run: uv run pytest",
+            returncode=2,
+        )
 
 
 @pytest.fixture(autouse=True)
