@@ -31,7 +31,7 @@ Copy `.env.example` to `.env`.
 | `DATABASE_URL` | Database for the API and worker when run outside Docker |
 | `TEST_DATABASE_URL` | Database for the tests. The name must end in `_test`; the test suite truncates all tables and refuses to run otherwise. |
 | `WORKER_POLL_INTERVAL` | Seconds the worker waits when there is no work (default `1`) |
-| `WORKER_PAUSE_SENTINEL` | While this file exists the worker does not process orders (default `.worker_paused`) |
+| `WORKER_PAUSE_SENTINEL` | While this file exists the worker does not process orders. `.env.example` sets `worker_pause/.worker_paused`; without it the default is `.worker_paused`. |
 
 Variables already set in the environment take precedence over `.env`. Do not commit `.env`.
 
@@ -42,6 +42,8 @@ docker compose up --build
 ```
 
 The API is on `http://localhost:8000` (docs at `/docs`). The worker starts once the API is healthy. The test database `order_api_test` is created automatically the first time the database volume is created; on an existing volume, create it manually (see Tests).
+
+The Docker worker watches `worker_pause/.worker_paused` on the host (mounted read-only into the container); see [Pause and resume processing](#pause-and-resume-processing-demonstration).
 
 ## Run locally
 
@@ -57,17 +59,19 @@ uv run python -m order_api.worker              # terminal 2
 Orders are always accepted; the worker only processes them while the sentinel file does not exist.
 
 ```bash
-touch worker_control/paused     # pause: new orders stay RECEIVED
-rm worker_control/paused        # resume: the worker catches up on the backlog
+touch worker_pause/.worker_paused     # pause: new orders stay RECEIVED
+rm worker_pause/.worker_paused        # resume: the worker catches up on the backlog
 ```
 
-This path is used by Docker Compose. For a local worker, set `WORKER_PAUSE_SENTINEL=worker_control/paused`. Make sure `scripts/seed_and_burst.py` uses the same path.
+This path is used by the Docker worker and, when `.env` is copied from `.env.example`, by a host-only worker. Without `.env`, a host-only worker falls back to `.worker_paused` in the repo root.
 
 ## Burst script
 
 `scripts/seed_and_burst.py` seeds demo products, submits a burst of orders (including intentional duplicates), and demonstrates the interruption scenario: orders are accepted while processing is paused, then processed after resuming. Each run uses a unique run ID, so it can be repeated without colliding with earlier data.
 
-**Prerequisites:** the database, API and worker must be running, and `.env` must exist so the script uses the same pause file as the worker (`WORKER_PAUSE_SENTINEL=worker_control/paused`).
+### Prerequisites
+
+The database, API and worker must be running. Copy `.env.example` to `.env` first: it sets `WORKER_PAUSE_SENTINEL=worker_pause/.worker_paused`, which the script, the Docker worker and a host-only worker all use.
 
 ```bash
 uv run python scripts/seed_and_burst.py                      # full demonstration
@@ -98,6 +102,15 @@ Interactive API documentation is available at `http://localhost:8000/docs` while
 `POST /orders` returns `202` with a `Location` header because stock processing happens asynchronously after the order is stored. See [SOLUTION.md](SOLUTION.md).
 
 ## Tests
+
+Start PostgreSQL first, then run the suite:
+
+```bash
+docker compose up -d db
+docker compose exec db pg_isready -U order_api -d order_api   # wait for "accepting connections"
+```
+
+Or, if running outside Docker:
 
 ```bash
 uv run pytest
@@ -144,7 +157,13 @@ uv run ruff format .
 The orders were accepted but nothing is processing them. Check, in order:
 
 1. The worker is running: `docker compose ps` (the `worker` service should be running) and `docker compose logs worker --tail 30`. Without Docker, start it with `uv run python -m order_api.worker`.
-2. No pause file is left over from an earlier run: `ls -la worker_control/ .worker_paused`, then `rm -f worker_control/paused .worker_paused`.
+2. No pause file is left over from an earlier run:
+
+   ```bash
+   ls -la worker_pause/.worker_paused .worker_paused
+   rm -f worker_pause/.worker_paused .worker_paused
+   ```
+
 3. The worker uses the same database as the API (`DATABASE_URL`), not the test database.
 
 Orders left in `RECEIVED` are processed as soon as a working worker starts.

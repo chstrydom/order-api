@@ -20,3 +20,4 @@ htmlcov/
 worker_pause/*
 !worker_pause/.gitkeep
 .worker_paused
+worker_pause/.worker_paused

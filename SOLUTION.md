@@ -99,6 +99,7 @@ The draft does not include a separate log table because application logging is o
 - Invalid request data returns `422 Unprocessable Entity`.
 - An unknown SKU returns `404 Not Found`; order creation must be atomic so that no partial order is committed.
 - Unknown order or product references return `404 Not Found`.
+- `GET /reports/daily` returns `200`, or `422` if `date` is missing or not a valid `YYYY-MM-DD` date.
 
 The implementation must ensure that validation and persistence failures do not leave a partially created order.
 
@@ -254,9 +255,9 @@ The schema is maintained in `src/order_api/db/schema.sql` and initialised throug
 
 The daily report is the selected extension option (Option B).
 
-The endpoint will report for the requested calendar date:
+The endpoint reports for the requested calendar date:
 
-- Total number of orders created, including orders that have not been processed or were rejected.
+- Total number of orders created, including orders that have not been processed or were rejected, with a count per status.
 - Revenue from successfully processed orders, calculated using their stored order-line prices.
 - Units sold per SKU, counting only successfully processed orders.
 - Current stock per SKU.
@@ -267,9 +268,11 @@ The reporting date filters orders by creation date, not processing date.
 
 Revenue and units sold include only orders created on the requested date that have reached `PROCESSED` status by the time the report is generated.
 
-The reporting timezone must be documented and applied consistently when determining the calendar-day boundaries.
+The reporting timezone is `Africa/Johannesburg` (UTC+2, no daylight saving). A calendar day is the half-open range `[00:00, next day 00:00)` in that timezone, so an order created at exactly midnight belongs to the new day. The response includes the timezone used.
 
-The report is calculated using the state of the database at generation time. Consequently, a report generated for a past date may include orders that were still `RECEIVED` when an earlier version of that report was generated but have since become `PROCESSED`.
+Response shape: `date`, `timezone`, `orders_total`, `orders_by_status` (`RECEIVED`, `PROCESSED`, `REJECTED`, each present even when 0), `revenue_cents`, and `skus` (every product, with `units_sold`, `revenue_cents` and `current_stock`).
+
+The report is calculated using the state of the database at generation time. Consequently, a report generated for a past date may include orders that were still `RECEIVED` when an earlier version of that report was generated but have since become `PROCESSED`. All report queries run in a single read-only REPEATABLE READ transaction, so order counts, revenue and stock levels come from one consistent snapshot.
 
 ## 8. Seed and burst
 
@@ -322,8 +325,13 @@ Run `uv run pytest` for the current test count.
 - Price refresh for existing orders.
 - Row-level security.
 
-## 12. Remaining implementation decisions
+## 12. Design decisions and known limitations
 
-The following details remain to be finalised during implementation:
-
+- The reporting timezone is `Africa/Johannesburg`; the worker poll interval defaults to 1 second and is configurable.
+- Each API request and each worker poll opens its own database connection. A connection pool is the upgrade path under higher load.
 - A rejected order does not record why it was rejected.
+- The worker retries database errors every poll interval without backoff.
+- `created_at` is the start time of the intake transaction, so processing order follows when orders began being stored, not when they committed.
+- The daily report shows current stock, not a historical end-of-day snapshot.
+- The pause sentinel is a demonstration hook, not a production control.
+- Stock replenishment, cancellation, authentication and a message broker are out of scope (section 11).
