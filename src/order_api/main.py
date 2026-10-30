@@ -1,8 +1,10 @@
 import os
 from contextlib import asynccontextmanager
+from datetime import date
+from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 
 from order_api.db import initialise_database
 from order_api.orders.exceptions import (
@@ -13,6 +15,8 @@ from order_api.orders.exceptions import (
 from order_api.orders.repository import create_order, get_order_by_ref
 from order_api.orders.schemas import CreateOrderRequest, OrderResponse
 from order_api.products.repository import get_product_by_sku
+from order_api.reports.repository import get_daily_report
+from order_api.reports.schemas import DailyReport
 
 # Does not override variables that are already set (e.g. by Docker Compose).
 load_dotenv(override=False)
@@ -96,3 +100,13 @@ def read_order(order_ref: str, database_url: str = Depends(get_database_url)):
         )
 
     return order
+
+
+@app.get("/reports/daily", response_model=DailyReport)
+def read_daily_report(
+    report_date: Annotated[
+        date, Query(alias="date", description="Calendar day, YYYY-MM-DD")
+    ],
+    database_url: str = Depends(get_database_url),
+):
+    return get_daily_report(database_url, report_date)
