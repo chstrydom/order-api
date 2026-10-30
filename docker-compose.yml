@@ -9,13 +9,26 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Creates the order_api_test database on first start of a fresh volume.
-      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U order_api -d order_api"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  db-init:
+    image: postgres:17
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-local_dev_password}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        psql -h db -U order_api -d postgres -tAc \
+          "SELECT 1 FROM pg_database WHERE datname = 'order_api_test'" \
+          | grep -q 1 \
+        || psql -h db -U order_api -d postgres -c "CREATE DATABASE order_api_test"
 
   api:
     build: .
